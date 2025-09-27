@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spodcopytool"
+version = "0.1.0"
+description = "Simple SharePoint/OneDrive copy tool (GUI) using Microsoft Graph"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "w0rmsp17" }]
+license = { text = "MIT" }
+keywords = ["microsoft-graph", "sharepoint", "onedrive", "migration", "copy", "gui", "tkinter"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Environment :: Win32 (MS Windows)",
+  "Environment :: MacOS X",
+  "Environment :: X11 Applications :: GTK",
+  "Topic :: System :: Archiving :: Backup"
+]
+
+dependencies = [
+  "msal>=1.25.0",
+  "requests>=2.31.0",
+  "urllib3>=2.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["graph_client*", "http_utils*", "ui*"]
+
+# GUI entry point (no console window on Windows)
+[project.gui-scripts]
+spodcopy = "main:main"
+
+
+# [project.scripts]
+# spodcopy = "main:main"
