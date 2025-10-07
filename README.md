@@ -36,3 +36,38 @@ python -m venv .venv
 
 # Install (editable)
 pip install -e .
+
+
+**USAGE**
+
+![NVIDIA_Overlay_cqUo8DI9G8](https://github.com/user-attachments/assets/db8f2eaa-fa61-423a-8849-06a4013ff351)
+
+## Usage (30s)
+
+1) **Run**
+   ```bash
+   python main.py
+Connect
+
+Enter TENANT, CLIENT (App ID), SECRET → click Connect.
+
+Pick Source
+Site → Library → Parent folder.
+Pick Destination
+Choose SharePoint or OneDrive (via the radio buttons).
+
+SharePoint: Site → Library → Parent.
+OneDrive: Search user → select user → root/parent.
+
+(Optional) ROOT_NAME
+
+Set the top-level folder name at the destination.
+
+Start / Monitor / Cancel
+Click Start to begin.
+Watch Stats (files, rate, elapsed, ETA, workers, throttles) and Output.
+Cancel anytime; progress is checkpointed in .state/.
+
+Notes
+Requires Graph app-only permissions (e.g., Files.ReadWrite.All, Sites.Read.All, User.Read.All).
+.state/ holds transient job data and is ignored by git.
