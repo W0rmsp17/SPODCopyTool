@@ -1,4 +1,5 @@
 # SP/OneDrive Copy Tool (GUI)
+![NVIDIA_Overlay_cqUo8DI9G8](https://github.com/user-attachments/assets/4fc67f26-7ae4-4cd4-80b3-f4573c744f08)
 
 A simple, resilient GUI tool to mirror folders and files from SharePoint/OneDrive (source) to SharePoint/OneDrive (destination) via Microsoft Graph (app-only). It supports resumable uploads, checkpoint/resume with per-job state, and a clean Tkinter UI.
 
@@ -40,9 +41,8 @@ pip install -e .
 
 **USAGE**
 
-![NVIDIA_Overlay_cqUo8DI9G8](https://github.com/user-attachments/assets/db8f2eaa-fa61-423a-8849-06a4013ff351)
 
-## Usage (30s)
+
 
 1) **Run**
    ```bash
