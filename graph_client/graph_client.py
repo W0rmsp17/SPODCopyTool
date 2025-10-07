@@ -7,18 +7,32 @@ from .graph_common import GRAPH, _enc
 
 
 class GraphClient:
-    def __init__(self, *, http, reset_token,
-                 timeout=(10,300), chunk=8*1024*1024, min_chunk=1*1024*1024,
-                 max_single=4*1024*1024, delete_extras=False):
+    def __init__(
+        self, *,
+        http, reset_token,
+        timeout=(10,300), chunk=8*1024*1024, min_chunk=1*1024*1024, max_single=4*1024*1024,
+        delete_extras=False,
+        get_cursor=None, set_cursor=None, clear_cursor=None, should_cancel=None,
+        on_discover_file=None, on_file_done=None,
+    ):
         self.RH = http
         self.reset_token = reset_token
         self.TIMEOUT = timeout
         self.DELETE_EXTRAS = delete_extras
 
         self.drive = DriveClient(http)
-        self.dir = DirectoryClient(http)
-        self.xfer = TransferManager(http, self.drive, chunk=chunk, min_chunk=min_chunk, max_single=max_single)
+        self.dir   = DirectoryClient(http)
+        self.xfer  = TransferManager(
+            http=self.RH,
+            drive_client=self.drive,
+            chunk=chunk, min_chunk=min_chunk, max_single=max_single,
+            get_cursor=get_cursor, set_cursor=set_cursor, clear_cursor=clear_cursor,
+            should_cancel=should_cancel,
+            on_discover_file=on_discover_file,
+            on_file_done=on_file_done,
+        )
         self.xfer.DELETE_EXTRAS = delete_extras
+
 
     #Directory and search passthrough
     def resolve_site_id_from_url(self, *a, **k): return self.dir.resolve_site_id_from_url(*a, **k)

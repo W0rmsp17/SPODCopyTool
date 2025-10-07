@@ -15,3 +15,5 @@ def _parse_site_url(url: str):
     if not host:
         raise ValueError("Invalid SharePoint site URL (missing host)")
     return host, path.rstrip("/")
+#
+

@@ -1,11 +1,9 @@
-
-
 import tkinter as tk
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from queue import Queue
 
-ENTRY_W   = 40   # left side text enties
+ENTRY_W   = 40   # left side text entries
 COMBO_W   = 36   # source/dest combo boxes
 LOG_W     = 120  # scrolling text width
 LOG_H     = 22   # Scrolling text height
@@ -42,17 +40,26 @@ class App:
         self.dest_user_query_var   = tk.StringVar()
         self.dest_user_name_var    = tk.StringVar()
 
+        # Stats vars (ADD: eta_var)
+        self.files_var    = tk.StringVar(value="0 / 0")
+        self.rate_var     = tk.StringVar(value="0.00 MB/s")
+        self.elapsed_var  = tk.StringVar(value="00:00:00")
+        self.eta_var      = tk.StringVar(value="--:--:--")
+        self.workers_var  = tk.StringVar(value="1")
+        self.throttle_var = tk.StringVar(value="0")
+
         # logger
         self.LOGQ = Queue()
 
-        # build gUI
+        # Build UI once
         self._build_ui()
 
-        # wire callbacks for controller to app
+        # Wire controller->app callbacks
         self.controller.set_callbacks(log=self.log, set_stage=self.set_stage)
 
-        # start draining log
+        # Start log drain + stats ticker
         self._drain_log()
+        self._tick_stats()
 
     # App <-> Controller callbacks
     def log(self, msg: str):
@@ -63,36 +70,32 @@ class App:
 
     # UI construction
     def _build_ui(self):
-        # Sizing constants
-        ENTRY_W = 40   # left-side text entries
-        COMBO_W = 36   # source/dest comboboxes (same width both sides)
-        LOG_W   = 120  # ScrolledText width (chars)
-        LOG_H   = 22   # ScrolledText height (rows)
-
-        # Panels
-        left  = ttk.Frame(self.root)
-        right = ttk.Frame(self.root)
-        left.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        right.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
-
-        # Window layout: left grows, right fixed
-        self.root.columnconfigure(0, weight=1)
-        self.root.columnconfigure(1, weight=0)
-        self.root.rowconfigure(0, weight=1)  # allow vertical growth for left output
-
-        # Left: only column 1 grows (for output)
-        left.columnconfigure(0, weight=0)
-        left.columnconfigure(1, weight=1)
-
-        # Right: keep controls fixed width
-        right.columnconfigure(0, weight=0)
-        right.columnconfigure(1, weight=0)
-
-        # Optional: starting size + minimums
+        # Window size 
         self.root.geometry("1200x720")
-        self.root.minsize(1000, 600)
+        self.root.minsize(1000, 620)
 
-        # Base fields (IDs + creds)
+        # root grid
+        for c in range(3):
+            self.root.columnconfigure(c, weight=1)
+        self.root.rowconfigure(0, weight=0)   
+        self.root.rowconfigure(1, weight=1)   
+        self.root.rowconfigure(2, weight=0)   
+
+        # Top strip frames
+        top_fields = ttk.LabelFrame(self.root, text="Fields", padding=6)
+        top_fields.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        top_fields.columnconfigure(1, weight=1) 
+
+        top_source = ttk.LabelFrame(self.root, text="Source", padding=6)
+        top_source.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
+        top_source.columnconfigure(1, weight=1)
+
+        top_stats = ttk.LabelFrame(self.root, text="Stats", padding=6)
+        top_stats.grid(row=0, column=2, sticky="nsew", padx=6, pady=6)
+        top_stats.columnconfigure(0, weight=1)
+        top_stats.columnconfigure(1, weight=1)
+
+        # Fields (IDs + creds)
         fields = [
             ("TENANT",     self.tenant_var),
             ("CLIENT",     self.client_var),
@@ -104,97 +107,149 @@ class App:
             ("ROOT_NAME",  self.root_name_var),
         ]
         for i, (label, var) in enumerate(fields):
-            ttk.Label(left, text=label).grid(row=i, column=0, sticky="w", padx=6, pady=4)
+            ttk.Label(top_fields, text=label).grid(row=i, column=0, sticky="w", padx=6, pady=4)
             ttk.Entry(
-                left,
+                top_fields,
                 textvariable=var,
                 width=ENTRY_W,
                 show="*" if label == "SECRET" else ""
-            ).grid(row=i, column=1, padx=6, pady=4, sticky="w")  # fixed width, no stretch
+            ).grid(row=i, column=1, padx=6, pady=4, sticky="ew")
 
-        # Output: bordered, larger, expands
-        out = ttk.LabelFrame(left, text="Output", padding=6)
-        out.grid(row=len(fields), column=0, columnspan=2, padx=6, pady=(8, 2), sticky="nsew")
+        # Stage readou(at end of Fields)
+        stage_row = len(fields)
+        ttk.Label(top_fields, text="Stage").grid(row=stage_row, column=0, sticky="w", padx=6, pady=(8, 0))
+        ttk.Label(top_fields, textvariable=self.stage_var).grid(row=stage_row, column=1, sticky="w", padx=6, pady=(8, 0))
 
-        self.log_box = ScrolledText(out, width=LOG_W, height=LOG_H, state="disabled",
-                                    borderwidth=1, relief="solid")
-        self.log_box.grid(row=0, column=0, sticky="nsew")
-        out.columnconfigure(0, weight=1)
-        out.rowconfigure(0, weight=1)
-        left.rowconfigure(len(fields), weight=1)  # let the output row expand
+        #source pickers
+        r = 0
+        ttk.Label(top_source, text="Site").grid(row=r, column=0, sticky="w")
+        self.src_site_combo = ttk.Combobox(top_source, textvariable=self.src_site_name_var, width=COMBO_W, state="readonly")
+        self.src_site_combo.grid(row=r, column=1, sticky="ew", padx=6, pady=2); r += 1
 
-        # Stage + controls
-        row_controls = len(fields) + 1
-        ttk.Label(left, text="Stage").grid(row=row_controls, column=0, sticky="w", padx=6)
-        ttk.Label(left, textvariable=self.stage_var).grid(row=row_controls, column=1, sticky="w", padx=6)
+        ttk.Label(top_source, text="Library").grid(row=r, column=0, sticky="w")
+        self.src_lib_combo = ttk.Combobox(top_source, textvariable=self.src_lib_name_var, width=COMBO_W, state="readonly")
+        self.src_lib_combo.grid(row=r, column=1, sticky="ew", padx=6, pady=2); r += 1
 
-        row_controls += 1
-        ttk.Button(left, text="Start",  command=self.on_start).grid(row=row_controls, column=0, pady=10, sticky="w")
-        ttk.Button(left, text="Cancel", command=self.on_cancel).grid(row=row_controls, column=1, pady=10, sticky="e")
+        ttk.Label(top_source, text="Parent folder").grid(row=r, column=0, sticky="w")
+        self.src_parent_combo = ttk.Combobox(top_source, textvariable=self.src_parent_name_var, width=COMBO_W, state="readonly")
+        self.src_parent_combo.grid(row=r, column=1, sticky="ew", padx=6, pady=2); r += 1
 
-        # Right: Connect button
-        ttk.Button(right, text="Connect", command=self.on_connect)\
-            .grid(row=0, column=1, sticky="e", padx=6, pady=(0, 6))
-
-        # Right: Source pickers (fixed width)
-        r = 1
-        ttk.Label(right, text="Source").grid(row=r, column=0, sticky="w"); r += 1
-
-        ttk.Label(right, text="Site").grid(row=r, column=0, sticky="w")
-        self.src_site_combo = ttk.Combobox(right, textvariable=self.src_site_name_var, width=COMBO_W, state="readonly")
-        self.src_site_combo.grid(row=r, column=1, sticky="w", padx=6, pady=2); r += 1
-
-        ttk.Label(right, text="Library").grid(row=r, column=0, sticky="w")
-        self.src_lib_combo = ttk.Combobox(right, textvariable=self.src_lib_name_var, width=COMBO_W, state="readonly")
-        self.src_lib_combo.grid(row=r, column=1, sticky="w", padx=6, pady=2); r += 1
-
-        ttk.Label(right, text="Parent folder").grid(row=r, column=0, sticky="w")
-        self.src_parent_combo = ttk.Combobox(right, textvariable=self.src_parent_name_var, width=COMBO_W, state="readonly")
-        self.src_parent_combo.grid(row=r, column=1, sticky="w", padx=6, pady=2); r += 2
-
-        # Destination mode
-        mode = ttk.Frame(right); mode.grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+        # Destination mode (SP / OD)
+        self._dest_section_row = r  
+        mode = ttk.Frame(top_source); mode.grid(row=r, column=0, columnspan=2, sticky="w", pady=(4, 0)); r += 1
         ttk.Label(mode, text="Destination:").pack(side="left")
         ttk.Radiobutton(mode, text="SharePoint", value="sp", variable=self.dst_type_var,
                         command=self.toggle_dest_mode).pack(side="left", padx=(8, 0))
         ttk.Radiobutton(mode, text="OneDrive", value="od", variable=self.dst_type_var,
                         command=self.toggle_dest_mode).pack(side="left", padx=(8, 0))
 
-        # Destination: SharePoint frame (fixed widths)
-        self.dest_sp = ttk.Frame(right)
+        # Destination: SharePoint subframe
+        self.dest_sp = ttk.Frame(top_source)
         ttk.Label(self.dest_sp, text="Site").grid(row=0, column=0, sticky="w")
         self.dest_site_combo = ttk.Combobox(self.dest_sp, textvariable=self.dest_site_name_var, width=COMBO_W, state="readonly")
-        self.dest_site_combo.grid(row=0, column=1, sticky="w", padx=6, pady=2)
+        self.dest_site_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
 
         ttk.Label(self.dest_sp, text="Library").grid(row=1, column=0, sticky="w")
         self.dest_lib_combo = ttk.Combobox(self.dest_sp, textvariable=self.dest_lib_name_var, width=COMBO_W, state="readonly")
-        self.dest_lib_combo.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+        self.dest_lib_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=2)
 
         ttk.Label(self.dest_sp, text="Parent folder").grid(row=2, column=0, sticky="w")
         self.dest_parent_combo = ttk.Combobox(self.dest_sp, textvariable=self.dest_parent_name_var, width=COMBO_W, state="readonly")
-        self.dest_parent_combo.grid(row=2, column=1, sticky="w", padx=6, pady=2)
+        self.dest_parent_combo.grid(row=2, column=1, sticky="ew", padx=6, pady=2)
 
-        # Destination: OneDrive frame (fixed widths)
-        self.dest_od = ttk.Frame(right)
+        # Destination: OneDrive subframe
+        self.dest_od = ttk.Frame(top_source)
         ttk.Label(self.dest_od, text="User search").grid(row=0, column=0, sticky="w")
         self.dest_user_entry = ttk.Entry(self.dest_od, textvariable=self.dest_user_query_var, width=COMBO_W)
-        self.dest_user_entry.grid(row=0, column=1, sticky="w", padx=6, pady=2)
+        self.dest_user_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
         ttk.Button(self.dest_od, text="Find users", command=self.on_search_users)\
             .grid(row=0, column=2, padx=6)
         self.dest_user_combo = ttk.Combobox(self.dest_od, textvariable=self.dest_user_name_var, width=COMBO_W, state="readonly")
-        self.dest_user_combo.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+        self.dest_user_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=2)
 
-        # Show correct destination sub-frame
-        self.toggle_dest_mode()
+        # Stats (labels inside top_stats)
+        ttk.Label(top_stats, text="Files").grid(row=0, column=0, sticky="w")
+        ttk.Label(top_stats, textvariable=self.files_var).grid(row=0, column=1, sticky="e")
+
+        ttk.Label(top_stats, text="Rate").grid(row=1, column=0, sticky="w")
+        ttk.Label(top_stats, textvariable=self.rate_var).grid(row=1, column=1, sticky="e")
+
+        ttk.Label(top_stats, text="Elapsed").grid(row=2, column=0, sticky="w")
+        ttk.Label(top_stats, textvariable=self.elapsed_var).grid(row=2, column=1, sticky="e")
+
+        ttk.Label(top_stats, text="ETA").grid(row=3, column=0, sticky="w")
+        ttk.Label(top_stats, textvariable=self.eta_var).grid(row=3, column=1, sticky="e")
+
+        ttk.Label(top_stats, text="Workers").grid(row=4, column=0, sticky="w")
+        ttk.Label(top_stats, textvariable=self.workers_var).grid(row=4, column=1, sticky="e")
+
+        ttk.Label(top_stats, text="Throttles").grid(row=5, column=0, sticky="w")
+        ttk.Label(top_stats, textvariable=self.throttle_var).grid(row=5, column=1, sticky="e")
+
+        # Output (spans all 3 columns)
+        out = ttk.LabelFrame(self.root, text="Output", padding=6)
+        out.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=6, pady=6)
+        out.columnconfigure(0, weight=1)
+        out.rowconfigure(0, weight=1)
+
+        self.log_box = ScrolledText(out, width=LOG_W, height=LOG_H, state="disabled",
+                                    borderwidth=1, relief="solid")
+        self.log_box.grid(row=0, column=0, sticky="nsew")
+
+        #Buttons (bottom row)
+        ttk.Button(self.root, text="Start",   command=self.on_start).grid( row=2, column=0, sticky="ew", padx=6, pady=6)
+        ttk.Button(self.root, text="Cancel",  command=self.on_cancel).grid(row=2, column=1, sticky="ew", padx=6, pady=6)
+        ttk.Button(self.root, text="Connect", command=self.on_connect).grid(row=2, column=2, sticky="ew", padx=6, pady=6)
 
         # Binders
         self.src_site_combo.bind("<<ComboboxSelected>>", self.on_src_site_selected)
         self.src_lib_combo.bind("<<ComboboxSelected>>", self.on_src_lib_selected)
         self.src_parent_combo.bind("<<ComboboxSelected>>", self.on_src_parent_chosen)
+        # Destination bindings (SP)
         self.dest_site_combo.bind("<<ComboboxSelected>>", self.on_dest_site_selected)
         self.dest_lib_combo.bind("<<ComboboxSelected>>", self.on_dest_lib_selected)
         self.dest_parent_combo.bind("<<ComboboxSelected>>", self.on_dest_parent_chosen)
+        # Destination bindings (OD)
         self.dest_user_combo.bind("<<ComboboxSelected>>", self.on_dest_user_chosen)
+
+        #ode toggle wiring
+        self.dst_type_var.trace_add("write", lambda *_: self.toggle_dest_mode())
+        self.toggle_dest_mode()
+
+    # Helpers for stats
+    def _fmt_hms(self, seconds: float) -> str:
+        s = max(0, int(seconds))
+        h, s = divmod(s, 3600)
+        m, s = divmod(s, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def _tick_stats(self):
+        s = self.controller.get_stats()  
+
+        files_total = s.get("files_total", 0)
+        files_done  = s.get("files_done", 0)
+        elapsed     = s.get("elapsed", 0.0)
+        rate_bps    = s.get("rate", 0.0)
+        workers     = s.get("workers", 1)
+        throttles   = s.get("throttles_recent", 0)
+
+        self.files_var.set(f"{files_done:,} / {files_total:,}")
+        self.rate_var.set(f"{(rate_bps/1024/1024):.2f} MB/s")
+        self.elapsed_var.set(self._fmt_hms(elapsed))
+        self.workers_var.set(str(workers))
+        self.throttle_var.set(str(throttles))
+
+        # ETA (file-count based)
+        if files_done > 0 and files_total > 0 and elapsed > 0:
+            files_per_sec = files_done / elapsed
+            remaining = max(0, files_total - files_done)
+            eta_sec = remaining / files_per_sec if files_per_sec > 0 else 0
+            self.eta_var.set(self._fmt_hms(eta_sec))
+        else:
+            self.eta_var.set("--:--:--")
+
+        self.root.after(1000, self._tick_stats)
+
     # GUI handlers
     def on_connect(self):
         names = self.controller.connect(
@@ -223,7 +278,6 @@ class App:
             self.src_parent_combo.current(0)
 
     def on_src_parent_chosen(self, _=None):
-        # bound in entry via src_parent_var
         pass
 
     def on_dest_site_selected(self, _=None):
@@ -243,7 +297,6 @@ class App:
             self.dest_parent_combo.current(0)
 
     def on_dest_parent_chosen(self, _=None):
-        # value is already bound via dest_parent_var
         pass
 
     def on_search_users(self):
@@ -288,13 +341,23 @@ class App:
         self.controller.cancel_job()
 
     def toggle_dest_mode(self):
-        # show or hide 
-        for f in (self.dest_sp, self.dest_od):
-            f.grid_forget()
-        if self.dst_type_var.get() == "sp":
-            self.dest_sp.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4,0))
+    # Sub-frame should sit directly UNDER the radio row.
+        base_row = self._dest_section_row + 1
+
+        # Always hide both first (
+        try: self.dest_sp.grid_remove()
+        except Exception: pass
+        try: self.dest_od.grid_remove()
+        except Exception: pass
+
+        if self.dst_type_var.get() == "od":
+            # Show OneDrive panel
+            self.dest_od.grid(row=base_row, column=0, columnspan=2,
+                            sticky="ew", padx=6, pady=(2, 0))
         else:
-            self.dest_od.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4,0))
+            # Show SharePoint panel
+            self.dest_sp.grid(row=base_row, column=0, columnspan=2,
+                            sticky="ew", padx=6, pady=(2, 0))
 
     # log drain
     def _drain_log(self):
@@ -310,4 +373,5 @@ class App:
         self.root.after(150, self._drain_log)
 
     def run(self):
+        
         self.root.mainloop()

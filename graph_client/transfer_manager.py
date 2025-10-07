@@ -1,34 +1,101 @@
 from __future__ import annotations
 
-from .graph_common import GRAPH, _enc
+import json
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
+from threading import BoundedSemaphore
+from graph_client.graph_common import GRAPH, _enc
 
 class TransferManager:
-    def __init__(
-        self,
-        http,
-        drive_client,
-        *,
-        chunk=8*1024*1024,
-        min_chunk=1*1024*1024,
-        max_single=4*1024*1024,
-        get_cursor=None,
-        set_cursor=None,
-        clear_cursor=None,
-        should_cancel=None,
-    ):
+    def __init__(self, http, drive_client, *,
+                 chunk=8*1024*1024, min_chunk=1*1024*1024, max_single=4*1024*1024,
+                 get_cursor=None, set_cursor=None, clear_cursor=None, should_cancel=None,
+                 on_discover_file=None, on_file_done=None,
+                 start_concurrency=2, max_concurrency=4, min_concurrency=1):
+
         self.RH = http
         self.drive = drive_client
-        self.CHUNK = chunk
-        self.MIN_CHUNK = min_chunk
-        self.MAX_SINGLE = max_single
+        self.CHUNK = int(chunk)
+        self.MIN_CHUNK = int(min_chunk)
+        self.MAX_SINGLE = int(max_single)
 
-        # resume/cancel hooks (controller supplies these)
+        # resume/cancel
         self.get_cursor = get_cursor or (lambda folder_id: None)
         self.set_cursor = set_cursor or (lambda folder_id, name: None)
         self.clear_cursor = clear_cursor or (lambda folder_id: None)
         self.should_cancel = should_cancel or (lambda: False)
 
-    #Downloads/Uploads
+        # stats hooks
+        self.on_discover_file = on_discover_file or (lambda size=0: None)
+        self.on_file_done     = on_file_done     or (lambda size=0: None)
+
+        # concurrency controls
+        self._conc_min = int(min_concurrency)
+        self._conc_max = int(max_concurrency)
+        self._target_capacity = max(self._conc_min, min(int(start_concurrency), self._conc_max))
+
+        # executor has room up to max; semaphore gates EFFECTIVE concurrency
+        self._executor = ThreadPoolExecutor(max_workers=self._conc_max, thread_name_prefix="xfer")
+        self._sem = BoundedSemaphore(value=self._conc_max)
+
+        # start at target_capacity by pre-consuming permits
+        for _ in range(self._conc_max - self._target_capacity):
+            self._sem.acquire()
+
+        # DELETE_EXTRAS is set by controller (optional)
+        if not hasattr(self, "DELETE_EXTRAS"):
+            self.DELETE_EXTRAS = False
+
+    # AIMD hooks 
+    def concurrency(self) -> int:
+        # report target capacity (what AIMD is steering)
+        return self._target_capacity
+
+    def scale_up(self) -> bool:
+        """Increase allowed concurrency by 1 (if below max)."""
+        if self._target_capacity >= self._conc_max:
+            return False
+        try:
+            self._sem.release()  
+            self._target_capacity += 1
+            return True
+        except ValueError:
+            return False
+
+    def scale_down(self) -> bool:
+        """Decrease allowed concurrency by 1 (non-blocking; won't reduce below min)."""
+        if self._target_capacity <= self._conc_min:
+            return False
+        ok = self._sem.acquire(blocking=False)  # only succeeds if a free permit exists
+        if ok:
+            self._target_capacity -= 1
+        return ok
+
+    def shutdown(self):
+        self._executor.shutdown(wait=False, cancel_futures=False)
+
+    # ---------- schedule gated copy ----------
+    def _submit_copy(self, *, dest_drive, did, nm, src_drive, item_id, src_size, sid, path, log):
+        # acquire a capacity permit before starting
+        self._sem.acquire()
+
+        def _job():
+            try:
+                self.upload_stream_replace(dest_drive, did, nm, src_drive, item_id, src_size)
+                log(f"  [COPY] {(path+'/'+nm if path else nm)} ({src_size} bytes)")
+                try: self.set_cursor(sid, nm)
+                except Exception: pass
+                try: self.on_file_done(src_size)
+                except Exception: pass
+            except Exception as e:
+                log(f"  [FAIL] {(path+'/'+nm if path else nm)} -> {e}")
+            finally:
+                # always release so another job can start
+                try: self._sem.release()
+                except ValueError: pass
+
+        return self._executor.submit(_job)
+
+    # downloads/uploads
     def _download_entire(self, drive, item_id):
         r = self.RH.get(f"{GRAPH}/drives/{drive}/items/{item_id}/content")
         r.raise_for_status()
@@ -137,9 +204,8 @@ class TransferManager:
                     if nxt is not None and nxt >= sent:
                         sent = nxt
 
-    #Mirroring
+    # mirroring 
     def mirror_files_exact(self, *, src_drive, src_parent="root", dest_drive, dest_parent, root_name, log):
-        # pick destination base (blank root_name => use dest_parent directly)
         if root_name:
             dst_root = self.drive.ensure_folder_by_path(dest_drive, dest_parent, root_name)
             base_path = root_name
@@ -147,21 +213,17 @@ class TransferManager:
             dst_root = dest_parent
             base_path = ""
 
-        # Stack frames:
-        #   ("DIR", src_id, dest_id, path)  -> process that folder
-        #   ("AFTER", parent_src_id, child_name) -> advance parent's cursor after child processed
+        # frames: ("DIR", sid, did, path) and ("AFTER", parent_sid, child_name)
         stack = [("DIR", (src_parent or "root"), dst_root, base_path)]
 
         while stack:
             frame = stack.pop()
 
-            # Post-visit: set cursor for parent after finishing a child folder
             if isinstance(frame, tuple) and frame and frame[0] == "AFTER":
                 _, parent_sid, child_name = frame
                 self.set_cursor(parent_sid, child_name)
                 continue
 
-            # Normal directory frame (back-compat with (sid, did, path))
             if frame and frame[0] == "DIR" and len(frame) == 4:
                 _, sid, did, path = frame
             else:
@@ -172,18 +234,17 @@ class TransferManager:
 
             log(f"[DIR] {path or '/'}")
 
-            # Build dest file map (only if delete_extras enabled)
-            dest_files = self.drive.list_files_map(dest_drive, did) if hasattr(self, "DELETE_EXTRAS") and self.DELETE_EXTRAS else {}
+            # DELETE_EXTRAS support
+            dest_files = self.drive.list_files_map(dest_drive, did) if self.DELETE_EXTRAS else {}
 
-            # Cursor for this source folder
             last = self.get_cursor(sid)
-
-            # Deterministic listing
             url = (
                 f"{GRAPH}/drives/{src_drive}/root/children?$top=200&$select=id,name,folder,file,size,hashes&$orderby=name"
                 if (sid == "root")
                 else f"{GRAPH}/drives/{src_drive}/items/{sid}/children?$top=200&$select=id,name,folder,file,size,hashes&$orderby=name"
             )
+
+            folder_futs = []
 
             while url:
                 if self.should_cancel():
@@ -192,23 +253,26 @@ class TransferManager:
                 for ch in j.get("value", []):
                     nm = ch["name"]
 
-                    # Skip anything <= last processed name (resume fast)
+                    # resume fast
                     if last is not None and nm <= last:
-                        if hasattr(self, "DELETE_EXTRAS") and self.DELETE_EXTRAS:
+                        if self.DELETE_EXTRAS:
                             dest_files.pop(nm, None)
                         continue
 
-                    # FOLDER child
                     if "folder" in ch:
                         ndid = self.drive.ensure_folder_by_path(dest_drive, did, nm)
-                        # Depth-first - only advance parent AFTER this subfolder is fully complete
                         stack.append(("AFTER", sid, nm))
                         stack.append(("DIR", ch["id"], ndid, f"{path+'/'+nm if path else nm}"))
                         continue
 
-                    # FILE child
+                    # file
                     src_size = ch.get("size", 0) or 0
                     src_hash = (ch.get("hashes") or {}).get("quickXorHash")
+
+                    #try: self.on_discover_file(sr _size)
+                    try: self.on_discover_file(1) 
+                    except Exception: pass
+
                     ex = self.drive.try_get_dest_file_fast(dest_drive, did, nm)
                     if ex:
                         _, dst_size, dst_hash = ex
@@ -218,47 +282,37 @@ class TransferManager:
 
                         if same_size and (hashes_known_and_equal or hashes_both_missing):
                             log(f"  [SKIP] {(path+'/'+nm if path else nm)} (size{' + hash' if hashes_known_and_equal else ' only'})")
-                            if hasattr(self, "DELETE_EXTRAS") and self.DELETE_EXTRAS:
+                            try: self.on_file_done(src_size)
+                            except Exception: pass
+                            if self.DELETE_EXTRAS:
                                 dest_files.pop(nm, None)
                             self.set_cursor(sid, nm); last = nm
-                            continue                    
-                    """
-                    if ex:
-                        _, dst_size, dst_hash = ex
-                        if (dst_size == src_size) and (src_hash and dst_hash and src_hash == dst_hash):
-                            log(f"  [SKIP] {(path+'/'+nm if path else nm)} (size+hash)")
-                            if hasattr(self, "DELETE_EXTRAS") and self.DELETE_EXTRAS:
-                                dest_files.pop(nm, None)
-                            # advance cursor to this file name
-                            self.set_cursor(sid, nm)
-                            last = nm
                             continue
-                    """     
-                    try:
-                        self.upload_stream_replace(dest_drive, did, nm, src_drive, ch["id"], src_size)
-                        log(f"  [COPY] {(path+'/'+nm if path else nm)} ({src_size} bytes)")
-                        if hasattr(self, "DELETE_EXTRAS") and self.DELETE_EXTRAS:
-                            dest_files.pop(nm, None)
-                        self.set_cursor(sid, nm)
-                        last = nm
-                    except Exception as e:
-                        log(f"  [FAIL] {(path+'/'+nm if path else nm)} -> {e}")
+
+                    fut = self._submit_copy(
+                        dest_drive=dest_drive, did=did, nm=nm,
+                        src_drive=src_drive, item_id=ch["id"], src_size=src_size,
+                        sid=sid, path=path, log=log
+                    )
+                    folder_futs.append(fut)
+                    if self.DELETE_EXTRAS:
+                        dest_files.pop(nm, None)
 
                 url = j.get("@odata.nextLink")
 
-            # Finished this folder's own children; any extras left are real extras
-            if hasattr(self, "DELETE_EXTRAS") and self.DELETE_EXTRAS and dest_files:
+            if folder_futs:
+                wait(folder_futs, return_when=FIRST_EXCEPTION)  # job logs handle exceptions
+
+            if self.DELETE_EXTRAS and dest_files:
                 for nm, (fid, _, _) in dest_files.items():
                     d = self.RH.delete(f"{GRAPH}/drives/{dest_drive}/items/{fid}")
                     if d.status_code not in (200, 204):
                         d.raise_for_status()
                     log(f"  [DELETE] {(path+'/'+nm if path else nm)}")
 
-            # Folder complete — clear its cursor to keep state minimal
             self.clear_cursor(sid)
 
     def mirror_folders_only(self, *, src_drive, src_parent="root", dest_drive, dest_parent, root_name, log):
-        # pick destination base (blank root_name => use dest_parent directly)
         if root_name:
             dst_root = self.drive.ensure_folder_by_path(dest_drive, dest_parent, root_name)
             base_path = root_name
@@ -270,11 +324,9 @@ class TransferManager:
         while stack:
             if self.should_cancel():
                 return
-
             sid, did, path = stack.pop()
             log(f"[DIR] {path or '/'}")
 
-            # Deterministic listing
             url = (
                 f"{GRAPH}/drives/{src_drive}/root/children?$top=200&$select=id,name,folder&$orderby=name"
                 if sid == "root"

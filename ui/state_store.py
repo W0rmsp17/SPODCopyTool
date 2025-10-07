@@ -37,6 +37,7 @@ class StateStore:
     def __init__(self, base_dir: str = ".state"):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._current_sig = None
 
     def _hash_signature(self, signature: Dict[str, Any]) -> str:
         payload = json.dumps(signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -45,7 +46,17 @@ class StateStore:
     def _path_for(self, signature: Dict[str, Any]) -> Path:
         h = self._hash_signature(signature)[:12]
         return self.base_dir / f"job-{h}.json"
-
+    
+    def ensure_fresh_state(self, signature: Dict[str, Any]) -> str:
+            """
+            Make this signature the 'current' job context.
+            No file I/O; just returns the path we will use for this job.
+            """
+            self._current_sig = signature
+            # ensure parent dir still exists (in case base got wiped)
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            return str(self._path_for(signature))    
+    
     def load(self, signature: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         p = self._path_for(signature)
         try:

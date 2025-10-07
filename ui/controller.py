@@ -1,9 +1,9 @@
 
 #import os
 import json
-from threading import Thread, Event
+import time
+from threading import Thread, Event, Lock
 from urllib.parse import quote
-from ui.state_store import StateStore
 from ui.state_store import StateStore, default_state_dir
 import msal
 
@@ -12,6 +12,98 @@ from graph_client import GraphClient
 
 from graph_client.graph_common import GRAPH
 
+import time
+from threading import Lock
+
+
+
+class Stats:
+    def __init__(self):
+        self._lk = Lock()
+        self._started_at = None       
+        self._finished_at = None
+        self.files_total = 0
+        self.files_done = 0
+        self.bytes_done = 0
+        self.current_workers = 1
+        self.throttles_recent = 0
+
+    #internal helpers
+    def _ensure_started(self):
+        if self._started_at is None:
+            self._started_at = time.time()
+
+    #counters (start timer on first real work)
+    def on_discover_file(self, n=1):
+        with self._lk:
+            self._ensure_started()
+            self.files_total += int(n)
+
+    def on_file_done(self, size=0):
+        with self._lk:
+            self._ensure_started()
+            self.files_done += 1
+            self.bytes_done += int(size)
+
+    def set_workers(self, n):
+        with self._lk:
+            self.current_workers = int(n)
+
+    def on_throttle(self, *_args, **_kw):
+        with self._lk:
+            self.throttles_recent += 1
+
+    def reset_throttle_window(self):
+        with self._lk:
+            self.throttles_recent = 0
+
+    #ifecycle (optional external calls)
+    def finish(self):
+        with self._lk:
+            self._finished_at = time.time()
+
+    #snapshot
+    def snapshot(self):
+        with self._lk:
+            now = time.time()
+            if self._started_at is None:
+                elapsed = 0
+            else:
+                elapsed = int((self._finished_at or now) - self._started_at)
+            rate = (self.bytes_done / elapsed) if elapsed > 0 else 0
+            return {
+                "files_total": self.files_total,
+                "files_done":  self.files_done,
+                "elapsed":     elapsed,
+                "rate":        rate,
+                "workers":     self.current_workers,
+                "throttles_recent": self.throttles_recent,
+            }
+
+
+    
+    def on_discover_file(self, n=1):
+        with self._lk:
+            self.files_total += n
+
+    def on_file_done(self, size=0):
+        with self._lk:
+            self.files_done += 1
+            self.bytes_done += int(size)
+
+    def set_workers(self, n):
+        with self._lk:
+            self.current_workers = int(n)
+
+    def add_throttles(self, n=1):
+        with self._lk:
+            self.throttles_recent += int(n)
+
+    def drain_throttles(self):
+        with self._lk:
+            n = self.throttles_recent
+            self.throttles_recent = 0
+            return n
 
 class Controller:
     def __init__(self, *, timeout, chunk, min_chunk, max_single, delete_extras):
@@ -22,7 +114,6 @@ class Controller:
         self.MAX_SINGLE = max_single
         self.DELETE_EXTRAS = delete_extras
         #state feilds
-        self.state = StateStore(base_dir=".state")
         self._state_sig = None
         self._state = None
         # rumtime
@@ -30,6 +121,8 @@ class Controller:
         self.RH = None
         self.client = None
         
+        self.stats = Stats()
+
         # Authentication
         self.TENANT = self.CLIENT = self.SECRET = ""
         self._T = None
@@ -60,7 +153,10 @@ class Controller:
 
         self.state = StateStore(base_dir=default_state_dir("SPODCopyTool"))
         self.log(f"[RESUME] Using state dir: {self.state.base_dir}")
-
+    
+    def get_stats(self):
+        return self.stats.snapshot()    
+    
     def _ensure_state(self):
         sig = self._job_signature()
         st = self.state.load(sig)
@@ -78,7 +174,6 @@ class Controller:
             self.state.clear(self._state_sig)
         self._state = None
 
-        #phases 
     def _job_signature(self) -> dict:
             return {
                 "tenant": self.TENANT or "",
@@ -89,7 +184,6 @@ class Controller:
                 "root_name": self.ROOT_NAME or "",
             }
 
-    # callbacks from App
     def set_callbacks(self, *, log, set_stage):
         self._log = log
         self._set_stage = set_stage
@@ -113,7 +207,6 @@ class Controller:
         if self._set_stage:
             self._set_stage(self._stage_text)
 
-    #  auth + HTTP
     def token(self):
         app = msal.ConfidentialClientApplication(
             self.CLIENT,
@@ -136,7 +229,7 @@ class Controller:
     def Hdyn(self):
         return {"Authorization": f"Bearer {self.get_token()}"}
 
-    # ---- cursor + cancel hooks used by TransferManager ----
+    #cursor + cancel hooks used by TransferManager
     def _cursor_get(self, folder_id):
         return (self._state or {}).get("folder_cursors", {}).get(folder_id)
 
@@ -145,9 +238,8 @@ class Controller:
             return
         fc = self._state.setdefault("folder_cursors", {})
         prev = fc.get(folder_id)
-        if prev is None or name > prev:             # advance only forward
+        if prev is None or name > prev:             
             fc[folder_id] = name
-            # persist occasionally; tune as you like
             cnt = getattr(self, "_cursor_updates", 0) + 1
             if cnt % 50 == 0:
                 self._save_state()
@@ -171,27 +263,34 @@ class Controller:
             get_auth_hdr=self.Hdyn,
             timeout=self.TIMEOUT,
             refresh_cb_default=self.reset_token,
+            on_throttle=self.stats.on_throttle,  
         )
+
         self.client = GraphClient(
             http=self.RH,
             reset_token=self.reset_token,
             timeout=self.TIMEOUT,
-            chunk=self.CHUNK,
-            min_chunk=self.MIN_CHUNK,
-            max_single=self.MAX_SINGLE,
+            chunk=self.CHUNK, min_chunk=self.MIN_CHUNK, max_single=self.MAX_SINGLE,
             delete_extras=self.DELETE_EXTRAS,
         )
 
-        # --- wire bookmark + cancel callbacks into transfer manager ---
+        try:
+            self.client.xfer.on_discover_file = self.stats.on_discover_file
+            self.client.xfer.on_file_done     = self.stats.on_file_done
+        except Exception:
+            pass
+
         x = self.client.xfer
         x.get_cursor    = self._cursor_get
         x.set_cursor    = self._cursor_set
         x.clear_cursor  = self._cursor_clear
         x.should_cancel = self._should_cancel
-        # Not in GUI Yet - not tested
         x.DELETE_EXTRAS = self.DELETE_EXTRAS
 
-    # highlevel actions (called by App) 
+        # stats hooks
+        x.on_discover_file = self.stats.on_discover_file
+        x.on_file_done     = self.stats.on_file_done
+
     def connect(self, *, tenant, client, secret):
         self.TENANT, self.CLIENT, self.SECRET = tenant.strip(), client.strip(), secret.strip()
         self._T = None
@@ -231,6 +330,12 @@ class Controller:
             self.SRC_PARENTS[nm] = fid
         names = list(self.SRC_PARENTS.keys())
         return {"drive_id": did, "parent_names": names, "default_parent_id": "root"}
+    
+    def select_src_parent(self, label: str):
+        fid = self.SRC_PARENTS.get(label)
+        if fid:
+            self.SRC_PARENT = fid
+        return self.SRC_PARENT
 
     def select_dst_site(self, name):
         sid = self.DST_SITES.get(name)
@@ -294,22 +399,49 @@ class Controller:
         }
     #---------------------
     #   job lifecycle
-    #--------------------
+    #---------------------
     def start_job(self, cfg: dict):
         # cfg keys: SRC_DRIVE, SRC_PARENT, DEST_DRIVE, DEST_PARENT, ROOT_NAME, TENANT, CLIENT, SECRET
-        self.SRC_DRIVE = cfg.get("SRC_DRIVE", "").strip()
+        self.SRC_DRIVE  = cfg.get("SRC_DRIVE", "").strip()
         self.SRC_PARENT = (cfg.get("SRC_PARENT") or "root").strip()
         self.DEST_DRIVE = cfg.get("DEST_DRIVE", "").strip()
-        self.DEST_PARENT = cfg.get("DEST_PARENT", "").strip()
-        self.ROOT_NAME = cfg.get("ROOT_NAME", "").strip()
-        self.TENANT = cfg.get("TENANT", "").strip()
-        self.CLIENT = cfg.get("CLIENT", "").strip()
-        self.SECRET = cfg.get("SECRET", "").strip()
+        self.DEST_PARENT= cfg.get("DEST_PARENT", "").strip()
+        self.ROOT_NAME  = cfg.get("ROOT_NAME", "").strip()
+        self.TENANT     = cfg.get("TENANT", "").strip()
+        self.CLIENT     = cfg.get("CLIENT", "").strip()
+        self.SECRET     = cfg.get("SECRET", "").strip()
         self._T = None
+
         self._ensure_state()
         phase = self._state.get("phase")
         self.log(f"[RESUME] Phase = {phase}")
-        
+
+        self._target_workers = 2
+
+        # reset stats fresh for this run
+        self.stats = Stats()
+        self.stats.set_workers(self._target_workers)
+
+        # rebind hooks if client already exists
+        if self.client is not None:
+            x = self.client.xfer
+            x.on_discover_file = self.stats.on_discover_file
+            x.on_file_done     = self.stats.on_file_done
+
+        self._start_aimd_loop_once()
+        job_sig = {
+            "src_drive":   cfg.get("SRC_DRIVE"),
+            "src_parent":  cfg.get("SRC_PARENT"),
+            "dest_drive":  cfg.get("DEST_DRIVE"),
+            "dest_parent": cfg.get("DEST_PARENT"),
+            "root":        cfg.get("ROOT_NAME"),
+        }
+        try:
+            self.state.ensure_fresh_state(job_sig)
+        except Exception as e:
+            self.log(f"[STATE] ensure_fresh_state error: {e}")
+
+        # runner thread
         def _runner():
             try:
                 self.lazy_init()
@@ -317,12 +449,53 @@ class Controller:
                 self.log(f"[INIT-ERROR] {e}")
                 return
             self._run_job()
-        
+
         Thread(target=_runner, daemon=True).start()
+
+
+    def _start_aimd_loop_once(self):
+        if getattr(self, "_aimd_thread", None) and self._aimd_thread.is_alive():
+            return
+        self._aimd_stop = False
+
+        def _aimd():
+            while not self._aimd_stop and not self.CANCEL_EV.is_set():
+                time.sleep(20)
+                snap = self.stats.snapshot()
+                thr = snap.get("throttles_recent", 0)
+
+                # safe no-ops if xfer lacks these methods
+                xu = getattr(self.client.xfer, "scale_up",  lambda: False)
+                xd = getattr(self.client.xfer, "scale_down",lambda: False)
+
+                if thr >= 2:
+                    if xd():
+                        self._target_workers = max(1, self._target_workers - 1)
+                        self.stats.set_workers(self._target_workers)
+                        self.log("[AIMD] throttle -> scale DOWN")
+                elif thr == 0 and snap["files_done"] < snap["files_total"]:
+                    if xu():
+                        self._target_workers = min(4, self._target_workers + 1)
+                        self.stats.set_workers(self._target_workers)
+                        self.log("[AIMD] stable -> scale UP")
+
+                self.stats.reset_throttle_window()
+
+        t = Thread(target=_aimd, name="_aimd", daemon=True)
+        t.start()
+        self._aimd_thread = t
 
     def cancel_job(self):
         self.CANCEL_EV.set()
-        self._save_state()  # flush bookmark immediately
+        # stop AIMD loop if running
+        try:
+            self._aimd_stop = True
+            if getattr(self, "_aimd_thread", None):
+                self._aimd_thread.join(timeout=0.5)
+        except Exception:
+            pass
+        self._finished_at = time.time()
+        self._save_state()
         self.log("[CANCEL] Requested. Will stop after current step.")
 
     #  the work
@@ -330,11 +503,12 @@ class Controller:
         try:
             _ = self.get_token()
             self.CANCEL_EV.clear()
+
             if self._state.get("phase") == "folders":
                 self.stage("mirroring folder structure")
-                self.log("######################")
-                self.log("#FILES MIRROR STARTED#")
-                self.log("######################")
+                self.log("########################")
+                self.log("#-FILES MIRROR STARTED-#")
+                self.log("########################")
                 self.client.mirror_folders_only(
                     src_drive=self.SRC_DRIVE,
                     src_parent=(self.SRC_PARENT or "root"),
@@ -345,10 +519,11 @@ class Controller:
                 )
                 self.stage_ok()
                 if self.CANCEL_EV.is_set():
-                    self.stage("cancelled"); self._save_state(); return
+                    self.stage("cancelled"); self._save_state()
+                    return
+
                 self._state["phase"] = "files"; self._save_state()
 
-            # Phase - file mirror
             if self._state.get("phase") == "files":
                 self.stage("copying files to destination")
                 self.client.mirror_files_exact(
@@ -361,10 +536,11 @@ class Controller:
                 )
                 self.stage_ok()
                 if self.CANCEL_EV.is_set():
-                    self.stage("cancelled"); self._save_state(); return
+                    self.stage("cancelled"); self._save_state()
+                    return
+
                 self._state["phase"] = "audit"; self._save_state()
 
-            # Phase - audit 
             if self._state.get("phase") == "audit":
                 self.stage("post job audit")
                 self._audit_pass(
@@ -376,12 +552,25 @@ class Controller:
                 )
                 self.stage_ok()
                 self.log("FILES MIRRORED")
-                # success => clear bookmark
                 self._clear_state()
 
         except Exception as e:
             self.stage_fail()
             self.log(f"[FATAL] {type(e).__name__}: {e}")
+
+        finally:
+            # stop AIMD + finish stats no matter what
+            try:
+                self._aimd_stop = True
+                if getattr(self, "_aimd_thread", None):
+                    self._aimd_thread.join(timeout=0.5)
+            except Exception:
+                pass
+            try:
+                self.stats.finish()
+            except Exception:
+                pass
+
 
     def _audit_pass(self, *, src_drive, src_parent, dest_drive, dest_parent, root_name):
         total_src = total_dst = 0

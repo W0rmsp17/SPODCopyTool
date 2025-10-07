@@ -60,11 +60,13 @@ def new_session():
 
 # wrapper 
 class RobustHTTP:
-    def __init__(self, session, get_auth_hdr, timeout=(10, 300), refresh_cb_default=None):
+    def __init__(self, session, get_auth_hdr, timeout=(10, 300), refresh_cb_default=None,
+                 on_throttle=None):
         self.S = session
-        self.get_auth_hdr = get_auth_hdr     # callable -> dict
+        self.get_auth_hdr = get_auth_hdr
         self.timeout = timeout
         self.refresh_cb_default = refresh_cb_default
+        self.on_throttle = on_throttle  
 
     def _merged_headers(self, headers):
         base = self.get_auth_hdr() or {}
@@ -107,6 +109,10 @@ class RobustHTTP:
                 if is_ok(code) or (ok_extra and code in ok_extra):
                     return r
                 if is_retry(code):
+                    if self.on_throttle and code in (429, 502, 503, 504):
+                        ra = _parse_retry_after(r.headers.get("Retry-After"))
+                        try: self.on_throttle(code, ra)
+                        except Exception: pass
                     _sleep_with_retry_after(r, a); continue
                 if is_auth(code):
                     break  # go refresh once
@@ -130,14 +136,16 @@ class RobustHTTP:
                 code = r.status_code
                 if is_ok(code) or (ok_extra and code in ok_extra):
                     return r
-                if is_retry(code) or is_auth(code):
+                if is_retry(code):
+                    if self.on_throttle and code in (429, 502, 503, 504):
+                        ra = _parse_retry_after(r.headers.get("Retry-After"))
+                        try: self.on_throttle(code, ra)
+                        except Exception: pass
                     _sleep_with_retry_after(r, b); continue
                 r.raise_for_status()
                 return r
             except requests.RequestException:
                 _sleep(b)
-
-        # Last response details (if any) for context
         msg = f"{method} failed after retries: {url}"
         try:
             # small safeguard: if r exists, surface a hint

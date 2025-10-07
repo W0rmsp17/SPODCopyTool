@@ -5,7 +5,7 @@ from .graph_common import GRAPH, _enc, _clean
 class DirectoryClient:
     def __init__(self, http):
         self.RH = http
-
+#Resolve f
     def resolve_site_id_from_url(self, site_url: str):
         host, path = _parse_site_url(site_url)
         r = self.RH.get(f"{GRAPH}/sites/{host}:{path}")
